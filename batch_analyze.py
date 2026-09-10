@@ -31,7 +31,7 @@ from scipy.signal import welch
 warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyzer_gui import (CSIFeatureViewer, MODES, TOP_K, CONSENSUS_TOL,  # noqa: E402
-                          WELCH_WINDOW_SEC, TH_HIGH_PROM, TH_HIGH_CONS)
+                          WELCH_WINDOW_SEC, TH_HIGH_PROM)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.batch_cache.pkl')
@@ -272,10 +272,9 @@ def report(rows, band, want_phase):
     G = [r for r in rows if r['all'] and r['grp'] == 'GEO']
     Nr = [r for r in rows if r['all'] and r['grp'] in ('EMPTY', 'HOLD')]
     if G and Nr:
-        print(f"\n{'=' * 92}\n現行門檻驗證（analyzer_gui.py：突出度 ≥ {TH_HIGH_PROM} "
-              f"且 共識度 ≥ {TH_HIGH_CONS * 100:.0f}%，Welch 窗長 {WELCH_WINDOW_SEC}s）\n{'=' * 92}")
-        hit = lambda r: (r['all']['prom'] >= TH_HIGH_PROM  # noqa: E731
-                         and r['all']['consensus'] >= TH_HIGH_CONS)
+        print(f"\n{'=' * 92}\n現行門檻驗證（analyzer_gui.py：突出度 ≥ {TH_HIGH_PROM}，"
+              f"Welch 窗長 {WELCH_WINDOW_SEC}s，不看共識度）\n{'=' * 92}")
+        hit = lambda r: r['all']['prom'] >= TH_HIGH_PROM  # noqa: E731
         tp = [r for r in G if hit(r)]
         fp = [r for r in Nr if hit(r)]
         print(f"  命中 {len(tp)}/{len(G)}　誤報 {len(fp)}/{len(Nr)}　"
@@ -288,8 +287,8 @@ def report(rows, band, want_phase):
             print(f"  誤報：{r['name'][:38]:38s} 突出度 {r['all']['prom']:5.1f} "
                   f"共識 {r['all']['consensus'] * 100:3.0f}%")
 
-        # 安全裕度：對照組中共識達標者的最高分 vs 呼吸組陽性最低分
-        neg_pass = [r['all']['prom'] for r in Nr if r['all']['consensus'] >= TH_HIGH_CONS]
+        # 安全裕度：對照組最高分 vs 呼吸組陽性最低分
+        neg_pass = [r['all']['prom'] for r in Nr]
         if neg_pass and tp:
             lo, hi = max(neg_pass), min(r['all']['prom'] for r in tp)
             print(f"  安全裕度：對照組共識達標者最高 {lo:.1f}，呼吸組陽性最低 {hi:.1f}"
@@ -302,24 +301,22 @@ def report(rows, band, want_phase):
         labels = [True] * len(G) + [False] * len(Nr)
 
         def pick(train, ytr):
+            """只掃突出度單一門檻——與 analyzer_gui 的判定規則一致。"""
             best = None
-            for th in np.arange(2, 40, 0.5):
-                for cs in (0.7, 0.8, 0.9, 1.0):
-                    t_ = sum(1 for r, y in zip(train, ytr)
-                             if y and r['all']['prom'] >= th and r['all']['consensus'] >= cs)
-                    f_ = sum(1 for r, y in zip(train, ytr)
-                             if not y and r['all']['prom'] >= th and r['all']['consensus'] >= cs)
-                    key = (f_ == 0, t_, -th)
-                    if best is None or key > best[0]:
-                        best = (key, th, cs)
-            return best[1], best[2]
+            for th in np.arange(2, 40, 0.25):
+                t_ = sum(1 for r, y in zip(train, ytr) if y and r['all']['prom'] >= th)
+                f_ = sum(1 for r, y in zip(train, ytr) if not y and r['all']['prom'] >= th)
+                key = (f_ == 0, t_, -th)
+                if best is None or key > best[0]:
+                    best = (key, th)
+            return best[1]
 
         tp = fp = fn = tn = 0
         for i in range(len(allr)):
             tr = [r for j, r in enumerate(allr) if j != i]
             ytr = [y for j, y in enumerate(labels) if j != i]
-            th, cs = pick(tr, ytr)
-            pred = (allr[i]['all']['prom'] >= th and allr[i]['all']['consensus'] >= cs)
+            th = pick(tr, ytr)
+            pred = allr[i]['all']['prom'] >= th
             if labels[i] and pred: tp += 1
             elif labels[i]: fn += 1
             elif pred: fp += 1
@@ -334,8 +331,8 @@ def report(rows, band, want_phase):
     if G and Nr:
         print(f"\n{'=' * 92}\n零誤報門檻掃描\n{'=' * 92}")
         best = []
-        for th in np.arange(2, 40, 0.5):
-            for cs in (0.7, 0.8, 0.9, 1.0):
+        for th in np.arange(2, 40, 0.25):
+            for cs in (0.0, 0.7, 0.8, 0.9, 1.0):
                 t_ = sum(1 for r in G if r['all']['prom'] >= th and r['all']['consensus'] >= cs)
                 f_ = sum(1 for r in Nr if r['all']['prom'] >= th and r['all']['consensus'] >= cs)
                 if f_ == 0:
@@ -349,7 +346,8 @@ def report(rows, band, want_phase):
                 seen.add((t_, cs))
                 if len(seen) > 6:
                     break
-                print(f"  突出度 ≥ {th:4.1f} 且 共識 ≥ {cs * 100:3.0f}%  →  "
+                cond = f"且 共識 ≥ {cs * 100:3.0f}%" if cs else "（不看共識）　　"
+                print(f"  突出度 ≥ {th:5.2f} {cond}  →  "
                       f"命中 {t_}/{len(G)}、誤報 0/{len(Nr)}")
         else:
             print("  找不到可零誤報的組合")

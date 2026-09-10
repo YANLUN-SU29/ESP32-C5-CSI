@@ -40,15 +40,27 @@ CONSENSUS_TOL = 0.02     # Hz；峰值頻率差距在此範圍內視為「同意
 # 呼吸率推估穩定度在 30s 與 60s 相同（±0.4 次/分），故取 30s。
 WELCH_WINDOW_SEC = 30
 
-# 判定門檻。以 12 筆呼吸 / 3 筆閉氣 / 5 筆空房間（110 條含相位格式）校準。
-# 主指標採「最佳單一子載波突出度」，共識度為必要輔助條件——本批資料中
-# 空房間曾出現突出度 5.5 但共識度僅 80% 的假峰值，單看突出度無法零誤報。
-# 現行組合命中 11/12、誤報 0/8；對照組中共識度達標者最高僅 3.3，
-# 呼吸組陽性最低 5.9，兩者間有明確間隔。
+# 判定門檻。以 40 筆（24 呼吸 / 6 閉氣 / 10 空房間，2026-09-08 與 09-10 兩日）校準。
+#
+# 只用「最佳單一子載波突出度」單一條件。曾把共識度當成必要的 AND 條件，
+# 但兩日資料出來後證實那樣反而更差——共識度會隨當日訊號強弱整體浮動，
+# 門檻選在哪一天決定的差很多（08 日選出 90%、10 日選出 100%），
+# 套到另一天就失準。以「訓練一日、測試另一日」評估：
+#
+#   規則                     跨日 08→10   跨日 10→08   平均     合併留一
+#   只看突出度                 75.0%       90.0%     82.5%    80.0%
+#   突出度 + 共識度             65.0%       90.0%     77.5%    72.5%
+#   突出度 + 時間穩定度          75.0%       80.0%     77.5%    80.0%
+#
+# 而且只看突出度時，兩日各自選出的門檻是 5.75 與 6.25，非常接近，
+# 表示這個門檻本身可以跨日搬移。取 6.5 可在 40 筆上做到零誤報（命中 17/24）。
+# 共識度仍然顯示出來供判讀，但不再當作硬性條件。
 #
 # 注意：突出度的數值尺度會隨 WELCH_WINDOW_SEC 改變，兩者必須一起調整。
-TH_HIGH_PROM, TH_HIGH_CONS = 5.5, 0.90
+TH_HIGH_PROM = 6.5
 TH_MID_PROM = 3.5
+# 共識度不再是判定條件，僅在低於此值時於畫面上加註提醒
+TH_CONS_NOTE = 0.70
 
 
 class CSIFeatureViewer:
@@ -418,7 +430,7 @@ class CSIFeatureViewer:
         self.ax3.axhline(1.0, color='gray', linewidth=0.8, alpha=0.6)
         if mode['calibrated']:
             self.ax3.axhline(TH_HIGH_PROM, color='black', linestyle=':', linewidth=1.2,
-                             label=f'高信心門檻 ({TH_HIGH_PROM:.0f}×)')
+                             label=f'高信心門檻 ({TH_HIGH_PROM:.1f}×)')
         self.ax3.set_title("3. 功率頻譜 (Welch PSD，已正規化為突出度倍率) — 確認峰值是真實週期，而非帶通造成的漣漪假象",
                            fontsize=11, fontweight='bold')
         self.ax3.set_xlabel("Frequency (Hz)")
@@ -462,16 +474,18 @@ class CSIFeatureViewer:
                      f"有 ground truth 可校準；此頻段缺對照組資料，門檻無法直接套用。")
             return
 
-        if prom >= TH_HIGH_PROM and cons >= TH_HIGH_CONS:
+        if prom >= TH_HIGH_PROM:
             verdict, fg = "● 高信心 — 偵測到穩定的週期性訊號", "#1a7f37"
         elif prom >= TH_MID_PROM:
             verdict, fg = "● 中等信心 — 有週期性跡象，但不夠明確", "#b8860b"
         else:
             verdict, fg = "● 低信心 — 與雜訊難以區分，不宜視為偵測到", "#b42318"
+        if prom >= TH_MID_PROM and cons < TH_CONS_NOTE:
+            verdict += f"（僅 {cons*100:.0f}% 子載波認同此頻率，建議重錄確認）"
         self.lbl_verdict.config(text=verdict, foreground=fg)
         self.lbl_hint.config(
-            text=f"判定依最強子載波：突出度 ≥{TH_HIGH_PROM:.0f} 且共識度 ≥{TH_HIGH_CONS*100:.0f}% 為高信心　"
-                 f"｜實測校準：呼吸 18~165 / 多為 100%，空房間 5.7~15.8，閉氣 5.6~11.8")
+            text=f"判定只看最強子載波突出度：≥{TH_HIGH_PROM:.1f} 為高信心、≥{TH_MID_PROM:.1f} 為中等　"
+                 f"｜40 筆實測範圍：呼吸 3.2~35.8（中位 9.5），空房間 2.0~5.5，閉氣 2.6~6.1")
 
 
 if __name__ == "__main__":
