@@ -260,8 +260,9 @@ python batch_analyze.py --no-cache     # 忽略快取重算
 ### `segment_analyze.py` — 分段分析（以憋氣段為負樣本）
 
 ```bash
-python segment_analyze.py               # 每段 24 秒（預設）
-python segment_analyze.py --seconds 20  # 改變片段長度
+python segment_analyze.py                  # 每段 24 秒（預設）
+python segment_analyze.py --seconds 20     # 改變片段長度
+python segment_analyze.py --save seg.csv   # 另存逐片段指標（畫圖或寫報告用）
 ```
 
 把**所有**檔案切成等長片段後才比較，因為突出度的尺度會隨 Welch 平均段數改變，

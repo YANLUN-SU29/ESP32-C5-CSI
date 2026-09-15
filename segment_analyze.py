@@ -20,6 +20,7 @@ GEO 與 EMPTY 取相同的三個時間窗，確保片段長度與處理方式完
 用法：
     python segment_analyze.py
     python segment_analyze.py --seconds 24 --band breath
+    python segment_analyze.py --save seg.csv   # 另存逐片段指標供畫圖用
 """
 import argparse
 import glob
@@ -100,6 +101,8 @@ def main():
     ap.add_argument('--seconds', type=float, default=24.0, help='每段長度（秒）')
     ap.add_argument('--band', default='breath', choices=list(MODES))
     ap.add_argument('--dir', default=DATA_DIR)
+    ap.add_argument('--save', metavar='CSV',
+                    help='另存逐片段指標到指定 CSV（畫圖或寫報告時方便）')
     args = ap.parse_args()
     band = MODES[args.band]['band']
     segs = segments(args.seconds)
@@ -132,8 +135,9 @@ def main():
         print(f"  {name[:40]:40s} 完成", flush=True)
 
     d = pd.DataFrame(rows)
-    d.to_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          '.segment_metrics.csv'), index=False)
+    if args.save:
+        d.to_csv(args.save, index=False, encoding='utf-8-sig')
+        print(f"  逐片段指標已存至 {args.save}")
 
     print(f"\n{'=' * 92}\n各狀態彙總（片段長度 {args.seconds:.0f} 秒）\n{'=' * 92}")
     print(f"{'狀態':8s} {'n':>4s} {'突出度 中位':>12s} {'四分位':>16s} "
