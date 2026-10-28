@@ -34,24 +34,30 @@ WINDOW_SIZE = 100
 GAP_WARN_THRESHOLD = 0.5  # 秒；相鄰兩筆樣本間隔超過此值視為訊號斷點
 
 # ----------------- [子載波擷取佈局] -----------------
-# 韌體實測送出 384 bytes = 192 條子載波，由三個 64 條的區塊組成：
-#   振幅索引   0~ 63  LLTF          （DC 在 0，保護頻帶 28~36）
-#   振幅索引  64~127  HT-LTF        （DC 在 64，保護頻帶 93~99）
-#   振幅索引 128~191  STBC-HT-LTF2  （DC 在 128，保護頻帶 157~163）
+# ESP32-C5 與 S3 的佈局完全不同，S3 的 LLTF/HT-LTF 索引不能沿用：
+#   - S3：一個封包同時帶 LLTF + HT-LTF (+ STBC)，各 64 條串在一起（256/384 bytes）
+#   - C5：一個封包只帶一種 LTF。韌體只開 HT20/VHT20，固定為 114 bytes = 57 條
 #
-# 取捨依據（以 600 筆實測 + 30 筆標註資料驗證）：
-#   - 各區塊第 0 條是 DC 離群值（LLTF 為 134.4，區塊中位數僅 17.6），非真實通道，剔除。
-#   - STBC-HT-LTF2 與 HT-LTF 的逐條時間序列相關係數中位數 0.902，屬冗餘，
-#     納入只會讓 PCA 對重複方向加倍加權，故捨棄。
-#   - HT-LTF 與 LLTF 相關性僅 0.06，是獨立的通道量測，值得納入。
+# C5 HT20/VHT20 的陣列順序（ESP-IDF 文件，C5 Wi-Fi 廠商功能章節）：
+#   陣列索引  0~28 → 子載波  0 ~ +28
+#   陣列索引 29~56 → 子載波 -28 ~ -1
 #
-# 舊版寫死 amplitudes[5:57]，等於存了 9 條恆為零的保護頻帶，
-# 又把視窗兩端切在滿振幅上（漏掉 LLTF 的 1~4 與 57~63 共 11 條）。
-LLTF_IDX = list(range(1, 28)) + list(range(37, 64))       # 54 條
-HTLTF_IDX = list(range(65, 93)) + list(range(100, 128))   # 56 條
-SUBCARRIER_IDX = LLTF_IDX + HTLTF_IDX                     # 110 條
+# 剔除：
+#   - 陣列索引 0（子載波 0）：DC，文件列為無效子載波
+#   - 陣列索引 1（子載波 +1）：C5 的 first_word_invalid——硬體限制使前 4 bytes
+#     （即前兩條子載波）可能無效。若只在旗標為 1 時剔除，欄位會時有時無、
+#     時間序列斷裂，故一律剔除，只損失 1 條。
+# 欄位依實體頻率由低到高排列（-28..-1, +2..+28），熱力圖上相鄰列即相鄰頻率。
+EXPECTED_LEN = 114                                        # bytes，其他長度整幀丟棄
+_NEG = list(range(29, 57))                                # 子載波 -28 ~ -1
+_POS = list(range(2, 29))                                 # 子載波  +2 ~ +28
+SUBCARRIER_IDX = _NEG + _POS                              # 55 條（陣列索引）
+SUBCARRIER_FREQ = [k - 57 if k >= 29 else k for k in SUBCARRIER_IDX]  # 對應的子載波編號
 SUBCARRIERS = len(SUBCARRIER_IDX)
-REQUIRED_AMPS = max(SUBCARRIER_IDX) + 1                   # 需要至少 128 條振幅（即 len=256 以上）
+
+# rx_ctrl.cur_bb_format 的意義（esp_wifi_he_types.h）
+BB_FORMAT_NAMES = {0: "11b", 1: "11a/g", 2: "HT", 3: "VHT", 4: "HE-SU",
+                   5: "HE-MU", 6: "HE-ERSU", 7: "HE-TB", 11: "VHT-MU"}
 
 # ----------------- [是否一併記錄相位] -----------------
 # ESP32 量到的是複數 CSI，過去只存振幅 sqrt(I²+Q²)，把 atan2(Q,I) 丟掉了，
@@ -62,15 +68,16 @@ REQUIRED_AMPS = max(SUBCARRIER_IDX) + 1                   # 需要至少 128 條
 # 線性去趨勢校正才可用。校正屬分析階段的工作，採集階段不應破壞原始資料。
 RECORD_PHASE = True
 
-# 欄位名稱直接標出區塊與原始振幅索引，讓資料自我描述。
+# 欄位名稱直接標出 LTF 種類與實體子載波編號（如 H-28、H5），讓資料自我描述。
+# 開頭維持 H，batch_analyze 依此歸入 HT-LTF 組。
 # 有相位時以 _A / _P 後綴區分，分析端才能只挑振幅欄（否則會把相位當成子載波混進 PCA）。
-_BASE_NAMES = [f"L{i}" for i in LLTF_IDX] + [f"H{i}" for i in HTLTF_IDX]
+_BASE_NAMES = [f"H{f}" for f in SUBCARRIER_FREQ]
 if RECORD_PHASE:
     COLUMN_NAMES = [f"{n}_A" for n in _BASE_NAMES] + [f"{n}_P" for n in _BASE_NAMES]
 else:
     COLUMN_NAMES = list(_BASE_NAMES)
 
-print(f"\n[啟動] Wi-Fi 雷達 (CSV 錄製模式：{ACTION_LABEL} / 動態 COM 版)...")
+print(f"\n[啟動] ESP32-C5 Wi-Fi 雷達 (CSV 錄製模式：{ACTION_LABEL} / 動態 COM 版)...")
 
 # ----------------- [動態 COM Port 掃描] -----------------
 def get_com_port():
@@ -87,7 +94,7 @@ def get_com_port():
         print("[錯誤] 找不到任何 USB 序列裝置，ESP32 似乎沒有被系統辨識。")
         print("       請檢查：")
         print("         1. USB 線是否支援資料傳輸（純充電線不行）")
-        print("         2. 是否已安裝 USB 轉序列埠驅動（NodeMCU-32S 多為 CP2102 或 CH340）")
+        print("         2. 是否已安裝 USB 轉序列埠驅動（ESP32-C5-DevKitC-1 的 UART 埠多為 CP2102N 或 CH343）")
         print("         3. 裝置管理員的「連接埠」或「其他裝置」有無帶驚嘆號的項目")
         if ports:
             print("       目前系統上只有這些非 USB 的序列埠（都不是 ESP32）：")
@@ -141,10 +148,11 @@ record_count = 0
 error_count = 0
 gap_count = 0
 layout_skip = 0       # 因長度不符預期佈局而丟棄的幀數
+fwi_count = 0         # first_word_invalid=1 的幀數（僅統計；該條子載波已一律剔除）
 consecutive_errors = 0  # 連續失敗次數，用於偵測序列埠斷線
 last_sample_time = None
 
-# 丟失率追蹤（需韌體 CSI_V3 以上）
+# 丟失率追蹤
 last_seq = None         # 上一筆的事件序號
 seq_lost = 0            # 序號跳號累計
 esp_drop_total = 0      # ESP32 端自報的累計丟棄數（佇列滿 + 長度異常）
@@ -159,9 +167,10 @@ class TruncatedLine(Exception):
     （例如 ESP32 開機時吐出的二進位垃圾），混在一起丟失率的帳就會算錯。
     """
 
-# 韌體 CSI_V2 格式帶回的中繼資料統計（用於確認子載波佈局與連線品質）
+# 韌體帶回的中繼資料統計（用於確認子載波佈局與連線品質）
 len_stats = {}        # 原始 CSI 位元組數 -> 出現次數
-sig_mode_stats = {}   # 0:非HT(11b/g) 1:HT(11n) -> 出現次數
+bb_format_stats = {}  # cur_bb_format -> 出現次數
+channel_stats = {}    # (主通道, 次通道) -> 出現次數
 rssi_samples = []
 meta_reported = False
 
@@ -170,7 +179,7 @@ fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratio
 fig.tight_layout(pad=4.0)
 
 ax1.set_title(f"{SUBCARRIERS} Subcarriers True Amplitude "
-              f"(LLTF {len(LLTF_IDX)} + HT-LTF {len(HTLTF_IDX)}) — Recording: {ACTION_LABEL}")
+              f"(ESP32-C5 HT/VHT-LTF 20MHz) — Recording: {ACTION_LABEL}")
 ax1.set_xlim(0, WINDOW_SIZE)
 ax1.set_ylim(0, 100)
 ax1.set_ylabel("Amplitude")
@@ -183,14 +192,14 @@ for i in range(SUBCARRIERS):
 
 cax = ax2.imshow(data_matrix, aspect='auto', cmap='jet', vmin=-15, vmax=15)
 ax2.set_title("2D CSI Spectrogram (Background Subtracted)")
-ax2.set_ylabel(f"Subcarrier (0-{SUBCARRIERS-1}: LLTF then HT-LTF)")
+ax2.set_ylabel(f"Subcarrier ({SUBCARRIER_FREQ[0]} → +{SUBCARRIER_FREQ[-1]})")
 ax2.set_xlabel("Time (Frames)")
 fig.colorbar(cax, ax=ax2, label="Amplitude Fluctuation")
 
 # ----------------- [資料更新邏輯] -----------------
 def update(frame):
     global data_matrix, record_count, error_count, gap_count, last_sample_time
-    global meta_reported, layout_skip, consecutive_errors
+    global meta_reported, layout_skip, consecutive_errors, fwi_count
     global last_seq, seq_lost, esp_drop_total, csi_lines, truncated
     updated = False
 
@@ -207,71 +216,67 @@ def update(frame):
         try:
             raw_data = ser.readline().decode('utf-8').strip()
             if raw_data.startswith(("CSI_V3", "CSI_V2", "CSI_DATA")):
+                # S3 版韌體的輸出：佈局不同，硬套 C5 的索引會得到錯誤的子載波
+                raise ValueError("收到 S3 版韌體格式，請改燒本專案的 C5 firmware.ino")
+            if raw_data.startswith("CSI_V4"):
+                # CSI_V4,<seq>,<len>,<rssi>,<bb_format>,<dropped>,<channel>,<second>,<fwi>,<csi...>
                 tokens = raw_data.split(',')
                 kind = tokens[0]
+                seq = int(tokens[1])
+                declared_len = int(tokens[2])
+                rssi = int(tokens[3])
+                bb_format = int(tokens[4])
+                esp_dropped = int(tokens[5])
+                channel = int(tokens[6])
+                second = int(tokens[7])
+                fwi = int(tokens[8])
+                csi_numbers = [int(x) for x in tokens[9:] if x.strip() != ""]
 
-                if kind == "CSI_V3":
-                    # CSI_V3,<seq>,<len>,<rssi>,<sig_mode>,<dropped>,<csi...>
-                    seq = int(tokens[1])
-                    declared_len = int(tokens[2])
-                    rssi = int(tokens[3])
-                    sig_mode = int(tokens[4])
-                    esp_dropped = int(tokens[5])
-                    csi_numbers = [int(x) for x in tokens[6:] if x.strip() != ""]
-                elif kind == "CSI_V2":
-                    # CSI_V2,<len>,<rssi>,<sig_mode>,<csi...>
-                    seq = esp_dropped = None
-                    declared_len = int(tokens[1])
-                    rssi = int(tokens[2])
-                    sig_mode = int(tokens[3])
-                    csi_numbers = [int(x) for x in tokens[4:] if x.strip() != ""]
-                else:
-                    # 舊格式：CSI_DATA,<csi...>
-                    seq = esp_dropped = declared_len = rssi = sig_mode = None
-                    csi_numbers = [int(x) for x in tokens[1:] if x.strip() != ""]
-
-                if declared_len is not None:
-                    # 長度與宣告不符代表該行被截斷（序列埠壅塞）。
-                    # 單獨計數而不併入 error_count——後者要留給真正的非 CSI 雜訊行
-                    # （例如開機時的二進位垃圾），否則丟失率的帳會算錯。
-                    if len(csi_numbers) != declared_len:
-                        raise TruncatedLine(
-                            f"宣告 {declared_len}，實得 {len(csi_numbers)}")
-                    len_stats[declared_len] = len_stats.get(declared_len, 0) + 1
-                    sig_mode_stats[sig_mode] = sig_mode_stats.get(sig_mode, 0) + 1
-                    rssi_samples.append(rssi)
+                # 長度與宣告不符代表該行被截斷（序列埠壅塞）。
+                # 單獨計數而不併入 error_count——後者要留給真正的非 CSI 雜訊行
+                # （例如開機時的二進位垃圾），否則丟失率的帳會算錯。
+                if len(csi_numbers) != declared_len:
+                    raise TruncatedLine(
+                        f"宣告 {declared_len}，實得 {len(csi_numbers)}")
+                len_stats[declared_len] = len_stats.get(declared_len, 0) + 1
+                bb_format_stats[bb_format] = bb_format_stats.get(bb_format, 0) + 1
+                channel_stats[(channel, second)] = channel_stats.get((channel, second), 0) + 1
+                rssi_samples.append(rssi)
+                fwi_count += fwi
 
                 csi_lines += 1
 
-                if seq is not None:
-                    # 序號跳號 = 該行在 ESP32 到 PC 之間整行遺失（過去完全偵測不到）
-                    if last_seq is not None and seq > last_seq + 1:
-                        seq_lost += seq - last_seq - 1
-                    last_seq = seq
-                    esp_drop_total = esp_dropped
+                # 序號跳號 = 該行在 ESP32 到 PC 之間整行遺失（過去完全偵測不到）
+                if last_seq is not None and seq > last_seq + 1:
+                    seq_lost += seq - last_seq - 1
+                last_seq = seq
+                esp_drop_total = esp_dropped
 
-                if not meta_reported and declared_len is not None:
+                if not meta_reported:
                     meta_reported = True
-                    mode_name = "非HT (11b/g)" if sig_mode == 0 else "HT (11n)"
+                    band = "5GHz" if channel > 14 else "2.4GHz"
                     print(f"[韌體] {kind} 格式 | 原始長度 {declared_len} bytes "
-                          f"({declared_len // 2} 條子載波) | RSSI {rssi} dBm | {mode_name}")
-                    print(f"[擷取] LLTF {len(LLTF_IDX)} 條 + HT-LTF {len(HTLTF_IDX)} 條 "
-                          f"= {SUBCARRIERS} 條（已剔除 DC 與保護頻帶，捨棄冗餘的 STBC 區塊）")
+                          f"({declared_len // 2} 條子載波) | RSSI {rssi} dBm | "
+                          f"{BB_FORMAT_NAMES.get(bb_format, bb_format)} | 通道 {channel} ({band})")
+                    print(f"[擷取] HT/VHT-LTF {SUBCARRIERS} 條"
+                          f"（子載波 {SUBCARRIER_FREQ[0]}~-1、+2~+{SUBCARRIER_FREQ[-1]}，"
+                          f"已剔除 DC 與 first_word 無效的 +1）")
                     print(f"[記錄] {'振幅 + 相位' if RECORD_PHASE else '僅振幅'}"
                           f"，CSV 共 {len(COLUMN_NAMES) + 1} 欄")
-                    if kind != "CSI_V3":
-                        print("[提示] 韌體為舊版格式，無法偵測傳輸遺失（建議更新韌體）")
 
+                # ESP-IDF 文件：每條子載波兩個 byte，「虛部在前、實部在後」。
+                # （S3 版把第一個 byte 當實部，振幅不受影響，但相位等於 π/2 - 真實相位；
+                #  分析端對相位做去趨勢後只看起伏，故兩版仍可比，C5 版改為正確順序。）
                 amplitudes, phases = [], []
                 for i in range(0, len(csi_numbers) - 1, 2):
-                    I, Q = csi_numbers[i], csi_numbers[i + 1]
-                    amplitudes.append(np.sqrt(I * I + Q * Q))
+                    imag, real = csi_numbers[i], csi_numbers[i + 1]
+                    amplitudes.append(np.sqrt(real * real + imag * imag))
                     if RECORD_PHASE:
-                        phases.append(np.arctan2(Q, I))
+                        phases.append(np.arctan2(imag, real))
 
-                if len(amplitudes) < REQUIRED_AMPS:
-                    # 長度不足代表這幀不是預期的佈局（例如非 HT 封包只有 LLTF），
-                    # 若照樣取索引會取到不存在或對應錯誤的子載波，故整幀丟棄。
+                if declared_len != EXPECTED_LEN:
+                    # 長度不符代表這幀不是 HT20/VHT20（例如 STBC 228、HT40 234），
+                    # 同一陣列索引會對應到不同的實體子載波，故整幀丟棄。
                     layout_skip += 1
                 else:
                     # 折線圖與熱力圖只顯示振幅，故振幅單獨留一份
@@ -364,10 +369,10 @@ finally:
     print(f"  - 解析丟棄：{error_count} 筆")
     print(f"  - 訊號斷點：{gap_count} 次（單次間隔 > {GAP_WARN_THRESHOLD}s）")
     if layout_skip:
-        print(f"  - 佈局不符丟棄：{layout_skip} 筆（振幅數不足 {REQUIRED_AMPS}，"
-              f"多為非 HT 封包只含 LLTF）")
+        print(f"  - 佈局不符丟棄：{layout_skip} 筆（長度不是 {EXPECTED_LEN} bytes，"
+              f"多為 STBC 或 40MHz 封包，見下方長度分布）")
 
-    # ---- 丟失率（需韌體 CSI_V3 以上）----
+    # ---- 丟失率 ----
     # 帳務說明：韌體是先 ++csi_seq 才入佇列，所以「佇列滿而被丟棄」的事件
     # 也已佔用一個序號，會表現為序號跳號。因此序號跳號已涵蓋 ESP32 端的佇列滿丟棄，
     # 兩者不可再相加（相加會重複計算）。
@@ -385,7 +390,7 @@ finally:
         print(f"  - 核對            ：{csi_lines} + {truncated} + {seq_lost} "
               f"= {accounted} vs {numbered}  {mark}")
         print(f"  - 韌體自報丟棄    ：{esp_drop_total} 筆"
-              f"（佇列滿已含在序號跳號內；另含長度異常，該類不佔序號）")
+              f"（佇列滿已含在序號跳號內；另含長度異常與硬體標記無效，該兩類不佔序號）")
         lost = seq_lost + truncated
         if numbered > 0:
             rate = lost / numbered * 100
@@ -396,7 +401,7 @@ finally:
                 print("    ⚠ 丟失率偏高。若韌體自報丟棄也大於 0，代表佇列排不及，"
                       "可加大 CSI_QUEUE_LEN 或改二進位輸出降低序列埠負載。")
     else:
-        print("\n  【丟失率分析】韌體為舊版格式（無序號），無法計算丟失率")
+        print("\n  【丟失率分析】沒有收到任何 CSI_V4 資料")
     if len_stats:
         total = sum(len_stats.values())
         print(f"  - CSI 原始長度分布：")
@@ -405,9 +410,15 @@ finally:
         if len(len_stats) > 1:
             print("      ⚠ 長度不一致代表混入不同型別的封包，同一陣列索引在不同幀")
             print("        會對應到不同的實體子載波，需在韌體端過濾。")
-        modes = {0: "非HT(11b/g)", 1: "HT(11n)", 2: "HT40", 3: "其他"}
         print(f"  - 封包型別分布：" + "，".join(
-            f"{modes.get(m, m)} {c} 筆" for m, c in sorted(sig_mode_stats.items())))
+            f"{BB_FORMAT_NAMES.get(m, m)} {c} 筆" for m, c in sorted(bb_format_stats.items())))
+        print(f"  - 通道分布：" + "，".join(
+            f"ch{ch}{'' if sec == 0 else ('+' if sec == 1 else '-')} {c} 筆"
+            for (ch, sec), c in sorted(channel_stats.items())))
+        if any(sec != 0 for ch, sec in channel_stats):
+            print("      ⚠ 出現次通道（40MHz），請把路由器該頻段的頻寬改為 20MHz")
+        print(f"  - first_word_invalid：{fwi_count} / {sum(len_stats.values())} 筆"
+              f"（該條子載波已一律剔除，僅供參考）")
     if rssi_samples:
         print(f"  - RSSI：平均 {sum(rssi_samples) / len(rssi_samples):.1f} dBm "
               f"(範圍 {min(rssi_samples)} ~ {max(rssi_samples)})")

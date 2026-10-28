@@ -6,9 +6,27 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
+// ===== 目標晶片：ESP32-C5 =====
+// 需要 arduino-esp32 3.3.0 以上（ESP-IDF 5.5），開發板選「ESP32C5 Dev Module」。
+// C5 的 CSI 設定結構、rx_ctrl 欄位與緩衝區佈局都和 S3 不同，S3 版不能直接燒。
+#if !CONFIG_IDF_TARGET_ESP32C5
+#error "此韌體僅適用 ESP32-C5（S3 版請用 ESP32-CSI 專案的 firmware.ino）"
+#endif
+
 
 const char* ssid = "WIFI CSI";
 const char* password = "Louis229";
+
+
+// ===== 頻段選擇（C5 為雙頻，路由器 TP-Link AC750 也是雙頻）=====
+// 0 = 只連 2.4 GHz，1 = 只連 5 GHz
+//
+// 必須固定單一頻段：設成自動的話，重連時可能換到另一個頻段，
+// 波長、通道、子載波間距全變，前後錄的資料就不能比。
+// 5 GHz 波長約 5.7cm（2.4 GHz 為 12.5cm），同樣的胸腔位移造成的相位變化約大一倍，
+// 且鄰居干擾較少，故預設 5 GHz。
+// 注意：路由器兩個頻段若用同一個 SSID，請在路由器端拆開或確認此設定生效。
+#define WIFI_USE_5G 1
 
 
 // ===== 觸發方式切換 =====
@@ -20,6 +38,7 @@ const char* password = "Louis229";
 // 指向路由器的 TCP delayed ACK 計時器。ICMP echo 不走該路徑。
 // 註：ICMP 路徑尚未實機驗證，故預設維持已驗證的 TCP 模式。
 //     要試 ping 請改為 1，並比對 monitor.py 結束統計的平均 fps。
+//     （以上實測數據來自 S3 + N300 路由器，換成 C5 + TP-Link 後需重新量測。）
 #define USE_ICMP_PING 0
 
 
@@ -27,6 +46,7 @@ WiFiClient client;
 IPAddress gateway; // 用來自動儲存路由器的 IP
 bool tcp_connected = false; // TCP 連線狀態旗標
 esp_ping_handle_t ping_handle = NULL;
+uint8_t ap_bssid[6] = {0}; // 只收路由器送來的封包，連線後填入
 
 
 // ===== CSI 事件佇列 =====
@@ -37,27 +57,48 @@ esp_ping_handle_t ping_handle = NULL;
 //
 // 改成：回呼只負責把資料丟進佇列（非阻塞），由 loop() 排空並輸出。
 // 佇列滿代表序列埠追不上，此時明確計數為 queue_full_drop——損失變成可量測的數字。
-#define CSI_MAX_LEN   384   // 目前設定下 HT20 為 256 bytes，留些餘裕
-#define CSI_QUEUE_LEN 24    // 24 * ~392 bytes ≈ 9.4KB
+//
+// C5 的 len 依封包型別而定（ESP-IDF 文件）：HT20/VHT20 為 114 bytes（57 條），
+// STBC 228、HT40 234、HE20 490。預期只會收到 114，但上限放寬到能容納 HE20，
+// 讓非預期型別仍能送到 PC 端被統計出來，而不是在這裡被默默當成長度異常。
+#define CSI_MAX_LEN   512
+#define CSI_QUEUE_LEN 24    // 24 * ~524 bytes ≈ 12.6KB（C5 有 384KB SRAM，足夠）
 
 typedef struct {
   uint32_t seq;       // 單調遞增序號，PC 端可據此偵測傳輸中遺失的行
   uint16_t len;
   int8_t   rssi;
-  uint8_t  sig_mode;
+  uint8_t  bb_format; // rx_ctrl.cur_bb_format：1=11a/g 2=HT 3=VHT 4~7=HE
+  uint8_t  channel;
+  uint8_t  second;    // 0=無次通道（20MHz），1=above，2=below
+  uint8_t  first_word_invalid;
   int8_t   buf[CSI_MAX_LEN];
 } csi_item_t;
 
 QueueHandle_t csi_queue = NULL;
 
 // 這些計數器由回呼（Wi-Fi task）寫入、loop 讀取，故標為 volatile
-volatile uint32_t csi_seq          = 0;  // 進入回呼且通過長度檢查的事件總數
+volatile uint32_t csi_seq          = 0;  // 進入回呼且通過檢查的事件總數
 volatile uint32_t queue_full_drop  = 0;  // 因佇列滿而丟棄（序列埠追不上）
 volatile uint32_t oversize_drop    = 0;  // 因長度異常而丟棄
+volatile uint32_t invalid_drop     = 0;  // 硬體標記 CSI 無效（rx_channel_estimate_info_vld=0）
 
 
 // CSI 回呼：只做最小工作量，絕不阻塞
 void _wifi_csi_cb(void *ctx, wifi_csi_info_t *data) {
+  // 只要路由器送來的封包：其他裝置的封包走的是不同路徑，
+  // 混進來會讓同一個子載波的時間序列在兩條通道之間跳動。
+  // 這類封包是刻意過濾，不算丟失，故不計數也不佔序號。
+  if (memcmp(data->mac, ap_bssid, 6) != 0) {
+    return;
+  }
+
+  // C5 的硬體會自報這筆通道估計是否有效（ESP-IDF 文件：為 0 時 CSI 無效）
+  if (!data->rx_ctrl.rx_channel_estimate_info_vld) {
+    invalid_drop++;
+    return;
+  }
+
   uint16_t len = data->len;
 
   // 長度異常直接丟棄，保護晶片不當機
@@ -67,10 +108,13 @@ void _wifi_csi_cb(void *ctx, wifi_csi_info_t *data) {
   }
 
   csi_item_t item;
-  item.seq      = ++csi_seq;
-  item.len      = len;
-  item.rssi     = data->rx_ctrl.rssi;
-  item.sig_mode = data->rx_ctrl.sig_mode;
+  item.seq                = ++csi_seq;
+  item.len                = len;
+  item.rssi               = data->rx_ctrl.rssi;
+  item.bb_format          = data->rx_ctrl.cur_bb_format;
+  item.channel            = data->rx_ctrl.channel;
+  item.second             = data->rx_ctrl.second;
+  item.first_word_invalid = data->first_word_invalid;
   memcpy(item.buf, data->buf, len);
 
   // 逾時 0：佇列滿就立刻放棄並計數，絕不在此等待
@@ -81,9 +125,11 @@ void _wifi_csi_cb(void *ctx, wifi_csi_info_t *data) {
 
 
 // 由 loop() 呼叫，把佇列內的 CSI 格式化後輸出
-// 行格式：CSI_V3,<seq>,<len>,<rssi>,<sig_mode>,<dropped>,<csi...>
-//   seq     = 事件序號，PC 端比對跳號即知傳輸中遺失了幾行
-//   dropped = ESP32 端累計丟棄數（佇列滿 + 長度異常），讓 PC 端直接看到丟失率
+// 行格式：CSI_V4,<seq>,<len>,<rssi>,<bb_format>,<dropped>,<channel>,<second>,<fwi>,<csi...>
+//   seq       = 事件序號，PC 端比對跳號即知傳輸中遺失了幾行
+//   dropped   = ESP32 端累計丟棄數（佇列滿 + 長度異常 + 硬體標記無效）
+//   bb_format = 取代 S3 的 sig_mode（C5 的 rx_ctrl 沒有 sig_mode）
+//   fwi       = first_word_invalid，1 表示前 4 bytes（前兩條子載波）因硬體限制無效
 // 回傳是否有輸出任何資料，供 loop 決定要不要讓出 CPU
 bool drain_csi_queue() {
   static char line_buf[4096];
@@ -92,12 +138,13 @@ bool drain_csi_queue() {
 
   while (xQueueReceive(csi_queue, &item, 0) == pdTRUE) {
     any = true;
-    uint32_t dropped = queue_full_drop + oversize_drop;
+    uint32_t dropped = queue_full_drop + oversize_drop + invalid_drop;
     int pos = 0;
-    pos += sprintf(line_buf + pos, "CSI_V3,%lu,%u,%d,%u,%lu",
+    pos += sprintf(line_buf + pos, "CSI_V4,%lu,%u,%d,%u,%lu,%u,%u,%u",
                    (unsigned long)item.seq, (unsigned)item.len,
-                   (int)item.rssi, (unsigned)item.sig_mode,
-                   (unsigned long)dropped);
+                   (int)item.rssi, (unsigned)item.bb_format,
+                   (unsigned long)dropped, (unsigned)item.channel,
+                   (unsigned)item.second, (unsigned)item.first_word_invalid);
     for (int i = 0; i < item.len; i++) {
       pos += sprintf(line_buf + pos, ",%d", item.buf[i]);
     }
@@ -143,10 +190,29 @@ void start_ping_session() {
 
 void setup() {
   Serial.begin(921600); // 高速鮑率，大幅提升傳輸吞吐量
-  Serial.println("\n[ESP32] CSI Radar (TCP Keep-Alive / 921600 baud)");
+  Serial.println("\n[ESP32-C5] CSI Radar (TCP Keep-Alive / 921600 baud)");
 
 
+  // WiFi.mode() 會啟動 Wi-Fi，頻段與頻寬都必須在啟動後、連線前設定
   WiFi.mode(WIFI_STA);
+
+#if WIFI_USE_5G
+  WiFi.setBandMode(WIFI_BAND_MODE_5G_ONLY);
+#else
+  WiFi.setBandMode(WIFI_BAND_MODE_2G_ONLY);
+#endif
+
+  // 【鎖定 20 MHz】只有 20 MHz 封包的 CSI 佈局固定為 114 bytes（57 條子載波）。
+  // TP-Link AC750 的 5 GHz 預設頻寬為自動（最高 80 MHz），若讓它送 HT40，
+  // len 會變 234，同一陣列索引對應到不同的實體子載波，PC 端只能整幀丟棄。
+  // 在 STA 端宣告只支援 20 MHz，路由器就只會用 20 MHz 跟我們傳。
+  wifi_bandwidths_t bw = { .ghz_2g = WIFI_BW_HT20, .ghz_5g = WIFI_BW_HT20 };
+  esp_err_t bw_err = esp_wifi_set_bandwidths(WIFI_IF_STA, &bw);
+  if (bw_err != ESP_OK) {
+    Serial.printf("[Warn] 無法鎖定 20MHz 頻寬：%s（請在路由器端把頻寬設為 20MHz）\n",
+                  esp_err_to_name(bw_err));
+  }
+
   WiFi.begin(ssid, password);
 
   // 【關閉 Wi-Fi 省電】STA 模式預設會開啟 modem sleep，在信標間隔之間關掉射頻，
@@ -161,30 +227,46 @@ void setup() {
   }
   Serial.println("\n[OK] Wi-Fi Connected");
   Serial.println("[Power] Wi-Fi modem sleep disabled (WIFI_PS_NONE)");
+  Serial.printf("[Link] Channel %ld (%s), RSSI %d dBm, BSSID %s\n",
+                (long)WiFi.channel(), WiFi.channel() > 14 ? "5GHz" : "2.4GHz",
+                WiFi.RSSI(), WiFi.BSSIDstr().c_str());
+
+  // 記下路由器的 BSSID，CSI 回呼據此過濾
+  memcpy(ap_bssid, WiFi.BSSID(), 6);
 
 
-  // 自動取得 N300 路由器的 IP
+  // 自動取得 TP-Link 路由器的 IP
   gateway = WiFi.gatewayIP();
   Serial.print("[Target] Gateway IP: ");
   Serial.println(gateway);
 
 
-  // 啟動 CSI 底層引擎
-  ESP_ERROR_CHECK(esp_wifi_set_csi(1));
- 
-  // stbc_htltf2_en 關閉：實測 STBC-HT-LTF2 與 HT-LTF 的逐條時間序列相關係數
-  // 中位數達 0.902，屬冗餘資料，PC 端本來就已捨棄。關掉可讓 len 由 384 降到 256 bytes，
-  // 每行序列埠傳輸時間約由 8ms 降到 5.3ms，使用率由 ~40% 降到 ~27%，
-  // 減少序列埠壅塞導致漏掉 CSI 事件的風險。
-  // （PC 端無需改動：擷取索引最大為 127，len=256 剛好提供 128 條振幅。）
+  // C5 的 CSI 設定與 S3 完全不同（S3 是 lltf_en/htltf_en...，C5 是逐型別開關）。
+  // 每個封包只會帶一種 LTF，不像 S3 會把 LLTF 與 HT-LTF 串在一起。
+  //
+  // - 只開 ht20 與 vht：路由器在 5 GHz 用 11ac 傳資料時是 VHT20，2.4 GHz 則是 HT20，
+  //   兩者佈局相同（ESP-IDF 文件：VHT 與 HT 的子載波索引、總長度一致）。
+  // - legacy 關閉：11a/g 封包（信標等）只有 LLTF，長度 106、佈局不同，混進來無益。
+  // - force_lltf 關閉：開啟後改為只取 LLTF（52 條可用），比 HT-LTF 的 56 條少，
+  //   且官方範例對其位元格式的處理與文件描述不一致，暫不採用。
+  // - ht40 關閉：上面已鎖 20MHz，這裡再擋一次。
+  // - HE（su/mu/dcm/beamformed）關閉：AC750 是 Wi-Fi 5，不會有 HE 封包。
   wifi_csi_config_t csi_config = {
-      .lltf_en           = true,
-      .htltf_en          = true,
-      .stbc_htltf2_en    = false,
-      .ltf_merge_en      = true,
-      .channel_filter_en = true,
-      .manu_scale        = false,
-      .shift             = false,
+      .enable                   = true,
+      .acquire_csi_legacy       = false,
+      .acquire_csi_force_lltf   = false,
+      .acquire_csi_ht20         = true,
+      .acquire_csi_ht40         = false,
+      .acquire_csi_vht          = true,
+      .acquire_csi_su           = false,
+      .acquire_csi_mu           = false,
+      .acquire_csi_dcm          = false,
+      .acquire_csi_beamformed   = false,
+      .acquire_csi_he_stbc_mode = 2,
+      .val_scale_cfg            = 0,
+      .dump_ack_en              = false,
+      .lltf_bit_mode            = 0,
+      .reserved                 = 0,
   };
   ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
 
@@ -199,6 +281,9 @@ void setup() {
                 (unsigned)(CSI_QUEUE_LEN * sizeof(csi_item_t)));
 
   ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&_wifi_csi_cb, NULL));
+
+  // 啟動 CSI 底層引擎（放在設定與回呼都就緒之後）
+  ESP_ERROR_CHECK(esp_wifi_set_csi(true));
 
 #if USE_ICMP_PING
   start_ping_session();
@@ -226,6 +311,7 @@ void loop() {
   // 第三個參數是連線逾時 (ms)。預設逾時可長達數秒，期間 loop() 被卡住、
   // 敲門封包停發、CSI 就斷流——實測 201 秒錄製出現 9 次中斷（最長 613ms）。
   // 壓成 500ms 可把單次卡頓上限鎖住。
+  // （TP-Link 路由器的管理頁面同樣在 port 80，敲門目標不必改。）
   if (!client.connected()) {
     if (client.connect(gateway, 80, 500)) {
       // 關閉 TCP 緩衝延遲，封包隨發隨至，減少卡頓

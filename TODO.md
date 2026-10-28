@@ -1,5 +1,15 @@
 # 開發路線圖 (TODO)
 
+## 🔄 ESP32-C5 移植（進行中）
+- [x] 韌體改用 C5 的 CSI API（`acquire_csi_ht20` / `acquire_csi_vht`），輸出格式升級為 CSI_V4。
+- [x] 鎖定單一頻段（`WIFI_USE_5G`）與 20MHz 頻寬，只收路由器 BSSID 的封包。
+- [x] `monitor.py` 改用 C5 HT20/VHT20 佈局（114 bytes → 55 條子載波），I/Q 改為虛部在前。
+- [x] 韌體以 arduino-esp32 3.3.10 編譯通過。
+- [ ] 實機驗證：長度分布全為 114、無次通道、first_word_invalid 比例、無恆零欄位。
+- [ ] 量測 C5 + TP-Link AC750 的 fps 與丟失率（TCP 敲門 vs ICMP ping 各錄一次比較）。
+- [ ] 比較 5 GHz 與 2.4 GHz 的呼吸突出度，決定預設頻段。
+- [ ] 用 C5 資料重錄 EMPTY / GEO / HOLD 並重新校準門檻（前一版門檻不適用）。
+
 ## ✅ 階段一：標準化資料收集 (已完成)
 - [x] 確認物理配置：N300 路由器與 ESP32 距離固定 (約 1.5m)，Channel 6 / 20MHz。
 - [x] 錄製 `Empty_10m` (空蕩房間)：純環境底噪，1 筆 10 分鐘。
