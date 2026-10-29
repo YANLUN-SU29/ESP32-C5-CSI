@@ -18,7 +18,7 @@ const char* ssid = "WIFI CSI";
 const char* password = "Louis229";
 
 
-// ===== 頻段選擇（C5 為雙頻，路由器 TP-Link AC750 也是雙頻）=====
+// ===== 頻段選擇（C5 為雙頻，路由器 TP-Link AX53 也是雙頻）=====
 // 0 = 只連 2.4 GHz，1 = 只連 5 GHz
 //
 // 必須固定單一頻段：設成自動的話，重連時可能換到另一個頻段，
@@ -202,8 +202,21 @@ void setup() {
   WiFi.setBandMode(WIFI_BAND_MODE_2G_ONLY);
 #endif
 
+  // 【不用 Wi-Fi 6 連線】路由器是 Wi-Fi 6（TP-Link AX53）時，C5 預設會以 11ax 連線，
+  // 路由器送來的就是 HE 封包：HE-LTF 為 490 bytes、佈局完全不同，而下方 csi_config
+  // 只收 HT/VHT，結果是一筆 CSI 都沒有。把 STA 支援的最高協定降到 11n/11ac，
+  // 路由器就改用 HT/VHT 傳給我們，114 bytes 的佈局維持不變。
+  // 只影響 C5 自己這條連線，路由器的 Wi-Fi 6 對其他裝置照常運作。
+  // （ESP-IDF：設定的是「最高」協定，11n 會自動含 11b/g，11ac 會自動含 11a/n。）
+  wifi_protocols_t protocols = { .ghz_2g = WIFI_PROTOCOL_11N, .ghz_5g = WIFI_PROTOCOL_11AC };
+  esp_err_t proto_err = esp_wifi_set_protocols(WIFI_IF_STA, &protocols);
+  if (proto_err != ESP_OK) {
+    Serial.printf("[Warn] 無法停用 11ax：%s（Wi-Fi 6 路由器可能收不到 CSI）\n",
+                  esp_err_to_name(proto_err));
+  }
+
   // 【鎖定 20 MHz】只有 20 MHz 封包的 CSI 佈局固定為 114 bytes（57 條子載波）。
-  // TP-Link AC750 的 5 GHz 預設頻寬為自動（最高 80 MHz），若讓它送 HT40，
+  // 路由器 5 GHz 預設頻寬多為自動（80 MHz 以上），若讓它送 HT40，
   // len 會變 234，同一陣列索引對應到不同的實體子載波，PC 端只能整幀丟棄。
   // 在 STA 端宣告只支援 20 MHz，路由器就只會用 20 MHz 跟我們傳。
   wifi_bandwidths_t bw = { .ghz_2g = WIFI_BW_HT20, .ghz_5g = WIFI_BW_HT20 };
@@ -250,7 +263,7 @@ void setup() {
   // - force_lltf 關閉：開啟後改為只取 LLTF（52 條可用），比 HT-LTF 的 56 條少，
   //   且官方範例對其位元格式的處理與文件描述不一致，暫不採用。
   // - ht40 關閉：上面已鎖 20MHz，這裡再擋一次。
-  // - HE（su/mu/dcm/beamformed）關閉：AC750 是 Wi-Fi 5，不會有 HE 封包。
+  // - HE（su/mu/dcm/beamformed）關閉：上方已停用 11ax，正常不會收到 HE 封包。
   wifi_csi_config_t csi_config = {
       .enable                   = true,
       .acquire_csi_legacy       = false,

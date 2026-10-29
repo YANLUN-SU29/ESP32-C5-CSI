@@ -3,10 +3,13 @@
 ## 🔄 ESP32-C5 移植（進行中）
 - [x] 韌體改用 C5 的 CSI API（`acquire_csi_ht20` / `acquire_csi_vht`），輸出格式升級為 CSI_V4。
 - [x] 鎖定單一頻段（`WIFI_USE_5G`）與 20MHz 頻寬，只收路由器 BSSID 的封包。
+- [x] 路由器改為 Archer AX53（Wi-Fi 6）：C5 停用 11ax，讓路由器改送 HT/VHT 封包。
 - [x] `monitor.py` 改用 C5 HT20/VHT20 佈局（114 bytes → 55 條子載波），I/Q 改為虛部在前。
 - [x] 韌體以 arduino-esp32 3.3.10 編譯通過。
 - [ ] 實機驗證：長度分布全為 114、無次通道、first_word_invalid 比例、無恆零欄位。
-- [ ] 量測 C5 + TP-Link AC750 的 fps 與丟失率（TCP 敲門 vs ICMP ping 各錄一次比較）。
+- [ ] 實機確認結束報告的封包型別為 HT/VHT（若出現 HE 代表停用 11ax 沒生效）。
+- [ ] 評估改收 HE-LTF（約 242 條子載波、490 bytes，fps 估計降到 40~50）是否值得。
+- [ ] 量測 C5 + TP-Link AX53 的 fps 與丟失率（TCP 敲門 vs ICMP ping 各錄一次比較）。
 - [ ] 比較 5 GHz 與 2.4 GHz 的呼吸突出度，決定預設頻段。
 - [ ] 用 C5 資料重錄 EMPTY / GEO / HOLD 並重新校準門檻（前一版門檻不適用）。
 

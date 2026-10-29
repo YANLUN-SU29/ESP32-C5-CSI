@@ -3,7 +3,7 @@
 用一片 ESP32-C5 開發板，從 Wi-Fi 訊號中偵測人的呼吸——不需穿戴任何裝置、不需攝影機。
 
 > **C5 移植版**：本專案由 [ESP32-CSI](https://github.com/YANLUN-SU29/ESP32-CSI)（ESP32 + MERCUSYS N300）
-> 移植到 **ESP32-C5 + TP-Link AC750 雙頻路由器**。韌體與 `monitor.py` 已改為 C5 的 CSI 格式，
+> 移植到 **ESP32-C5 + TP-Link Archer AX53 雙頻路由器**。韌體與 `monitor.py` 已改為 C5 的 CSI 格式，
 > 分析工具（`analyzer_gui.py`、`batch_analyze.py`、`segment_analyze.py`）不需改動即可讀新格式。
 >
 > ⚠️ **第 8、9、11、13 節的門檻、成果與實驗數據全部來自前一版硬體。** C5 的子載波數
@@ -72,7 +72,7 @@ CSI 就是這些響應的量測值，是**複數**——包含振幅（訊號衰
 ┌──────────────┐   Wi-Fi 封包    ┌──────────────┐
 │  路由器 (Tx) │ ◄────────────── │  ESP32 (Rx)  │
 │  TP-Link     │ ──────────────► │  ESP32-C5    │
-│  AC750       │   回傳單播封包   │              │
+│  AX53        │   回傳單播封包   │              │
 └──────────────┘                 └──────┬───────┘
                                         │ USB 序列埠
                     ESP32 每收到一個封包就       │ 921600 baud
@@ -122,7 +122,7 @@ ESP32 的 CSI 引擎只在收到**單播**封包時才會觸發，廣播封包�
 
 | 角色 | 設備 | 設定 |
 |------|------|------|
-| **發射端 (Tx)** | TP-Link AC750 雙頻路由器（Wi-Fi 5） | 建議 5 GHz、**頻寬固定 20MHz**、固定通道 |
+| **發射端 (Tx)** | TP-Link Archer AX53 雙頻路由器（Wi-Fi 6） | 建議 5 GHz、**頻寬固定 20MHz**、固定通道 |
 | **接收端 (Rx)** | ESP32-C5 開發板（如 ESP32-C5-DevKitC-1） | 接 **UART 埠**（USB 轉序列晶片那個） |
 | **監測端** | Windows PC | Python 3.12 |
 
@@ -137,6 +137,8 @@ ESP32 的 CSI 引擎只在收到**單播**封包時才會觸發，廣播封包�
 - 5 GHz **頻寬設 20MHz**、**通道固定**（不要自動）。韌體已在 STA 端宣告只支援 20MHz，
   但路由器端也鎖住最保險；若結束報告出現「次通道」警告就是這裡沒設好
 - 管理頁面維持在 Port 80（TCP 敲門的目標）
+- 若有 Smart Connect（頻段導向）或 OFDMA 選項，建議關閉
+- 路由器的 Wi-Fi 6 **不用關**：韌體已讓 C5 自己以 11n/11ac 連線（見下方差異表）
 
 **與前一版（ESP32 + N300）的差異**
 
@@ -147,6 +149,7 @@ ESP32 的 CSI 引擎只在收到**單播**封包時才會觸發，廣播封包�
 | CSI 長度 | 256 bytes | 114 bytes | 序列埠每行約縮短一半 |
 | CSI 設定 | `lltf_en`、`htltf_en`… | `acquire_csi_ht20`、`acquire_csi_vht`… | API 不相容，韌體不能共用 |
 | 封包型別欄位 | `rx_ctrl.sig_mode` | `rx_ctrl.cur_bb_format` | 輸出格式 V3 → V4 |
+| 連線協定 | 11b/g/n | 最高 11n（2.4G）／11ac（5G），**停用 11ax** | Wi-Fi 6 路由器改送 HT/VHT 封包，佈局維持 114 bytes |
 | 來源過濾 | 無 | 只收路由器 BSSID | 鄰居流量不再混入 |
 | 硬體自報無效 | 無 | `rx_channel_estimate_info_vld`、`first_word_invalid` | 無效幀丟棄並計數 |
 
@@ -225,6 +228,7 @@ python batch_analyze.py
 | `CSI_QUEUE_LEN` | `24` | CSI 事件佇列長度（約 12.6KB） |
 | `csi_config` | HT20 + VHT 開、其餘關 | 只收 20MHz 的 HT/VHT 封包，佈局固定為 114 bytes |
 | 頻寬 | HT20 | `esp_wifi_set_bandwidths` 在 STA 端宣告只支援 20MHz |
+| 協定 | 最高 11n / 11ac | `esp_wifi_set_protocols` 停用 11ax；否則 Wi-Fi 6 路由器送 HE 封包，CSI 收不到 |
 
 **架構重點**：CSI 回呼**只**把資料丟進 FreeRTOS 佇列就返回，絕不在回呼裡做序列埠輸出。
 原因見[第 11 節](#11-開發過程中的重要發現)。輸出由 `loop()` 負責排空。
