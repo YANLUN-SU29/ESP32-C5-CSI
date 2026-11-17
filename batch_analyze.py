@@ -9,6 +9,7 @@
     python batch_analyze.py --phase        # 一併分析相位
     python batch_analyze.py --band heart   # 改分析心跳頻段
     python batch_analyze.py --no-cache     # 忽略快取重算
+    python batch_analyze.py --trim 0       # 不扣頭尾（預設各扣 10 秒；舊資料用 0）
 
 分組規則依檔名前綴（可用 --pattern 調整）：
     CSI_EMPTY*      -> EMPTY（無人對照）
@@ -31,7 +32,8 @@ from scipy.signal import welch
 warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyzer_gui import (CSIFeatureViewer, MODES, TOP_K, CONSENSUS_TOL,  # noqa: E402
-                          WELCH_WINDOW_SEC, TH_HIGH_PROM)
+                          WELCH_WINDOW_SEC, TH_HIGH_PROM, TRIM_SEC,
+                          load_time_axis, data_columns, trim_mask)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.batch_cache.pkl')
@@ -71,12 +73,13 @@ def sanitize_phase(phase_mat):
     return unwrapped - (mean_per_row + slope * idx_c)
 
 
-def load_file(path, want_phase):
-    """讀檔並回傳 (時間軸, fps, 振幅矩陣, 相位矩陣或 None, 欄名)。"""
+def load_file(path, want_phase, trim=TRIM_SEC):
+    """讀檔並回傳 (時間軸, fps, 振幅矩陣, 相位矩陣或 None, 欄名)。頭尾各扣 trim 秒。"""
     df = pd.read_csv(path)
-    cols = list(df.columns[1:])
-    ts = pd.to_datetime(df.iloc[:, 0], format='%H:%M:%S.%f')
-    t = (ts - ts.iloc[0]).dt.total_seconds().values
+    cols = data_columns(df)
+    t = load_time_axis(df)
+    keep = trim_mask(t, trim)
+    df, t = df[keep], t[keep] - t[keep][0]
     fps = (len(t) - 1) / t[-1] if t[-1] > 0 else 60.0
 
     p_cols = [c for c in cols if str(c).endswith('_P')]
@@ -137,7 +140,7 @@ def band_metrics(freqs, psd, band, helper, col_names=None, subset=None):
 
 
 # --------------------------------------------------------------- 主流程 --
-def analyse(paths, band, want_phase, use_cache=True):
+def analyse(paths, band, want_phase, use_cache=True, trim=TRIM_SEC):
     cache = {}
     if use_cache and os.path.exists(CACHE):
         try:
@@ -149,13 +152,13 @@ def analyse(paths, band, want_phase, use_cache=True):
     rows = []
     for path in paths:
         name = os.path.basename(path)
-        key = (name, os.path.getmtime(path), want_phase)
+        key = (name, os.path.getmtime(path), want_phase, trim)
         if key in cache:
             rows.append(cache[key])
             print(f"  {name[:38]:38s} (快取)")
             continue
 
-        t, fps, amp, pha, a_cols = load_file(path, want_phase)
+        t, fps, amp, pha, a_cols = load_file(path, want_phase, trim)
         freqs, psd, idx = per_subcarrier_psd(amp, fps, helper)
         names = [a_cols[i] for i in idx]
 
@@ -360,6 +363,8 @@ def main():
     ap.add_argument('--phase', action='store_true', help='一併分析相位')
     ap.add_argument('--no-cache', action='store_true', help='忽略快取重算')
     ap.add_argument('--dir', default=DATA_DIR, help='資料夾路徑')
+    ap.add_argument('--trim', type=float, default=TRIM_SEC,
+                    help=f'每檔頭尾各扣掉的秒數（預設 {TRIM_SEC:g}；舊資料用 0）')
     args = ap.parse_args()
 
     band = MODES[args.band]['band']
@@ -368,8 +373,8 @@ def main():
         print(f"[錯誤] {args.dir} 內找不到 CSV")
         return
     print(f"[分析] {len(paths)} 個檔案，頻段 {args.band} {band} Hz"
-          f"{'，含相位' if args.phase else ''}")
-    rows = analyse(paths, band, args.phase, use_cache=not args.no_cache)
+          f"{'，含相位' if args.phase else ''}，頭尾各扣 {args.trim:g} 秒")
+    rows = analyse(paths, band, args.phase, use_cache=not args.no_cache, trim=args.trim)
     report(rows, band, args.phase)
 
 

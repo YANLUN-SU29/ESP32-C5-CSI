@@ -21,6 +21,9 @@ GEO 與 EMPTY 取相同的三個時間窗，確保片段長度與處理方式完
     python segment_analyze.py
     python segment_analyze.py --seconds 24 --band breath
     python segment_analyze.py --save seg.csv   # 另存逐片段指標供畫圖用
+    python segment_analyze.py --trim 0         # 不扣頭尾（預設各扣 10 秒；舊資料用 0）
+
+頭尾扣除後時間軸重新從 0 起算，上面的分段時間窗都是相對於扣除後的起點。
 """
 import argparse
 import glob
@@ -36,7 +39,8 @@ from scipy.signal import welch
 
 warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from analyzer_gui import CSIFeatureViewer, MODES  # noqa: E402
+from analyzer_gui import (CSIFeatureViewer, MODES, TRIM_SEC,  # noqa: E402
+                          load_time_axis, data_columns, trim_mask)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 NFFT = 8192
@@ -58,12 +62,14 @@ def parse_label(name):
     return (m.group(1), m.group(2)) if m else ('OTHER', None)
 
 
-def load(path):
+def load(path, trim=TRIM_SEC):
+    """頭尾各扣 trim 秒後，時間軸重新從 0 起算——分段時間窗以扣除後的起點為準。"""
     df = pd.read_csv(path)
-    ts = pd.to_datetime(df.iloc[:, 0], format='%H:%M:%S.%f')
-    t = (ts - ts.iloc[0]).dt.total_seconds().values
+    t = load_time_axis(df)
+    keep = trim_mask(t, trim)
+    df, t = df[keep], t[keep] - t[keep][0]
     fps = (len(t) - 1) / t[-1] if t[-1] > 0 else 60.0
-    cols = list(df.columns[1:])
+    cols = data_columns(df)
     a_cols = [c for c in cols if str(c).endswith('_A')] or cols
     amp = df[a_cols].values.astype(float)
     return t, fps, amp[:, ~np.all(amp == 0, axis=0)]
@@ -103,18 +109,22 @@ def main():
     ap.add_argument('--dir', default=DATA_DIR)
     ap.add_argument('--save', metavar='CSV',
                     help='另存逐片段指標到指定 CSV（畫圖或寫報告時方便）')
+    ap.add_argument('--trim', type=float, default=TRIM_SEC,
+                    help=f'每檔頭尾各扣掉的秒數，分段時間窗從扣除後起算'
+                         f'（預設 {TRIM_SEC:g}；舊資料用 0）')
     args = ap.parse_args()
     band = MODES[args.band]['band']
     segs = segments(args.seconds)
     helper = CSIFeatureViewer.__new__(CSIFeatureViewer)
 
     paths = sorted(glob.glob(os.path.join(args.dir, '*.csv')))
-    print(f"[分段分析] {len(paths)} 檔，每段 {args.seconds:.0f} 秒，頻段 {args.band} {band} Hz")
+    print(f"[分段分析] {len(paths)} 檔，每段 {args.seconds:.0f} 秒，頻段 {args.band} {band} Hz，"
+          f"頭尾各扣 {args.trim:g} 秒")
     rows = []
     for path in paths:
         name = os.path.basename(path)
         grp, pos = parse_label(name)
-        t, fps, amp = load(path)
+        t, fps, amp = load(path, args.trim)
         day = re.search(r'_(20260\d{3})_', name)
         for lab, s0, s1 in segs:
             i0, i1 = int(np.searchsorted(t, s0)), int(np.searchsorted(t, s1))

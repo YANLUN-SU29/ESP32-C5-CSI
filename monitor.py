@@ -77,6 +77,10 @@ if RECORD_PHASE:
 else:
     COLUMN_NAMES = list(_BASE_NAMES)
 
+# ESP 端的封包抵達時間（微秒，韌體 CSI_V5 起提供），放在 Timestamp 之後。
+# PC 端的 Timestamp 是在畫圖迴圈裡才蓋的，樣本一批一批到，不代表真正的取樣時刻。
+ESP_TIME_COL = "EspTime_us"
+
 print(f"\n[啟動] ESP32-C5 Wi-Fi 雷達 (CSV 錄製模式：{ACTION_LABEL} / 動態 COM 版)...")
 
 # ----------------- [動態 COM Port 掃描] -----------------
@@ -138,7 +142,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 filename = os.path.join(DATA_DIR, f"CSI_{ACTION_LABEL}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 csv_file = open(filename, 'w', newline='')
 csv_writer = csv.writer(csv_file)
-csv_writer.writerow(['Timestamp'] + COLUMN_NAMES)
+csv_writer.writerow(['Timestamp', ESP_TIME_COL] + COLUMN_NAMES)
 
 print(f"[錄製] CSV 輸出路徑：{filename}")
 
@@ -153,6 +157,7 @@ consecutive_errors = 0  # 連續失敗次數，用於偵測序列埠斷線
 last_sample_time = None
 
 # 丟失率追蹤
+first_seq = None        # 本次錄製收到的第一個序號（ESP32 不會因開新錄製而重開機，序號是接續的）
 last_seq = None         # 上一筆的事件序號
 seq_lost = 0            # 序號跳號累計
 esp_drop_total = 0      # ESP32 端自報的累計丟棄數（佇列滿 + 長度異常）
@@ -173,6 +178,13 @@ bb_format_stats = {}  # cur_bb_format -> 出現次數
 channel_stats = {}    # (主通道, 次通道) -> 出現次數
 rssi_samples = []
 meta_reported = False
+
+# 完整 57 條（含已剔除的 DC、+1）的振幅統計，用來核對佈局。
+# 實測 3 筆空房間時陣列索引 28（目前標為 +28）恆為 0，與官方文件「索引 0 為 DC」不符，
+# 可能是佈局差一格。結束時印出逐索引平均，恆為 0 的那格才是真正的 DC／空子載波。
+raw_amp_sum = np.zeros(EXPECTED_LEN // 2)
+raw_zero_count = np.zeros(EXPECTED_LEN // 2, dtype=int)
+raw_frames = 0
 
 # ----------------- [建立雙層視覺化畫布] -----------------
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [1, 1.5]})
@@ -200,7 +212,8 @@ fig.colorbar(cax, ax=ax2, label="Amplitude Fluctuation")
 def update(frame):
     global data_matrix, record_count, error_count, gap_count, last_sample_time
     global meta_reported, layout_skip, consecutive_errors, fwi_count
-    global last_seq, seq_lost, esp_drop_total, csi_lines, truncated
+    global first_seq, last_seq, seq_lost, esp_drop_total, csi_lines, truncated
+    global raw_amp_sum, raw_zero_count, raw_frames
     updated = False
 
     # 序列埠若被拔掉，in_waiting 會直接拋例外，需在迴圈外攔下
@@ -218,8 +231,9 @@ def update(frame):
             if raw_data.startswith(("CSI_V3", "CSI_V2", "CSI_DATA")):
                 # S3 版韌體的輸出：佈局不同，硬套 C5 的索引會得到錯誤的子載波
                 raise ValueError("收到 S3 版韌體格式，請改燒本專案的 C5 firmware.ino")
-            if raw_data.startswith("CSI_V4"):
-                # CSI_V4,<seq>,<len>,<rssi>,<bb_format>,<dropped>,<channel>,<second>,<fwi>,<csi...>
+            if raw_data.startswith(("CSI_V5", "CSI_V4")):
+                # CSI_V5,<seq>,<len>,<rssi>,<bb_format>,<dropped>,<channel>,<second>,<fwi>,<esp_us>,<csi...>
+                # CSI_V4 同上但沒有 <esp_us>（舊版韌體，CSV 的 EspTime_us 欄留空）
                 tokens = raw_data.split(',')
                 kind = tokens[0]
                 seq = int(tokens[1])
@@ -230,7 +244,13 @@ def update(frame):
                 channel = int(tokens[6])
                 second = int(tokens[7])
                 fwi = int(tokens[8])
-                csi_numbers = [int(x) for x in tokens[9:] if x.strip() != ""]
+                if kind == "CSI_V5":
+                    esp_us = int(tokens[9])
+                    data_start = 10
+                else:
+                    esp_us = ""
+                    data_start = 9
+                csi_numbers = [int(x) for x in tokens[data_start:] if x.strip() != ""]
 
                 # 長度與宣告不符代表該行被截斷（序列埠壅塞）。
                 # 單獨計數而不併入 error_count——後者要留給真正的非 CSI 雜訊行
@@ -249,6 +269,8 @@ def update(frame):
                 # 序號跳號 = 該行在 ESP32 到 PC 之間整行遺失（過去完全偵測不到）
                 if last_seq is not None and seq > last_seq + 1:
                     seq_lost += seq - last_seq - 1
+                if first_seq is None:
+                    first_seq = seq
                 last_seq = seq
                 esp_drop_total = esp_dropped
 
@@ -262,7 +284,10 @@ def update(frame):
                           f"（子載波 {SUBCARRIER_FREQ[0]}~-1、+2~+{SUBCARRIER_FREQ[-1]}，"
                           f"已剔除 DC 與 first_word 無效的 +1）")
                     print(f"[記錄] {'振幅 + 相位' if RECORD_PHASE else '僅振幅'}"
-                          f"，CSV 共 {len(COLUMN_NAMES) + 1} 欄")
+                          f"，CSV 共 {len(COLUMN_NAMES) + 2} 欄")
+                    if kind == "CSI_V4":
+                        print("[提示] 韌體為 V4，沒有 ESP 端時間戳（EspTime_us 欄留空），"
+                              "建議重燒最新 firmware.ino")
 
                 # ESP-IDF 文件：每條子載波兩個 byte，「虛部在前、實部在後」。
                 # （S3 版把第一個 byte 當實部，振幅不受影響，但相位等於 π/2 - 真實相位；
@@ -279,6 +304,10 @@ def update(frame):
                     # 同一陣列索引會對應到不同的實體子載波，故整幀丟棄。
                     layout_skip += 1
                 else:
+                    raw_amp_sum += amplitudes
+                    raw_zero_count += np.asarray(amplitudes) == 0
+                    raw_frames += 1
+
                     # 折線圖與熱力圖只顯示振幅，故振幅單獨留一份
                     amp_selected = [amplitudes[i] for i in SUBCARRIER_IDX]
                     row = amp_selected
@@ -296,7 +325,7 @@ def update(frame):
 
                     # CSV 寫入（常駐 file handle，定期 flush）
                     timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')
-                    csv_writer.writerow([timestamp] + row)
+                    csv_writer.writerow([timestamp, esp_us] + row)
                     record_count += 1
                     if record_count % 50 == 0:
                         csv_file.flush()
@@ -377,10 +406,12 @@ finally:
     # 也已佔用一個序號，會表現為序號跳號。因此序號跳號已涵蓋 ESP32 端的佇列滿丟棄，
     # 兩者不可再相加（相加會重複計算）。
     # 長度異常的丟棄則發生在編號之前，不佔序號，只反映在韌體自報的 dropped 內。
+    # 序號要從本次收到的第一筆算起：ESP32 在兩次錄製之間不會重開機，序號是接續的。
+    # 舊版用「序號最大值」當總數，實測 3 筆空房間都多算出 18~33 萬筆不存在的「差」。
     if last_seq is not None:
-        numbered = last_seq          # ESP32 已編號的事件總數
+        numbered = last_seq - first_seq + 1   # 本次錄製期間 ESP32 編號的事件數
         print(f"\n  【丟失率分析】")
-        print(f"  - ESP32 已編號事件：{numbered} 筆（序號最大值）")
+        print(f"  - ESP32 已編號事件：{numbered} 筆（序號 {first_seq} ~ {last_seq}）")
         print(f"  - 完整收到        ：{csi_lines} 筆")
         print(f"  - 行截斷損壞      ：{truncated} 筆")
         print(f"  - 序號跳號        ：{seq_lost} 筆")
@@ -401,7 +432,7 @@ finally:
                 print("    ⚠ 丟失率偏高。若韌體自報丟棄也大於 0，代表佇列排不及，"
                       "可加大 CSI_QUEUE_LEN 或改二進位輸出降低序列埠負載。")
     else:
-        print("\n  【丟失率分析】沒有收到任何 CSI_V4 資料")
+        print("\n  【丟失率分析】沒有收到任何 CSI 資料")
     if len_stats:
         total = sum(len_stats.values())
         print(f"  - CSI 原始長度分布：")
@@ -419,6 +450,17 @@ finally:
             print("      ⚠ 出現次通道（40MHz），請把路由器該頻段的頻寬改為 20MHz")
         print(f"  - first_word_invalid：{fwi_count} / {sum(len_stats.values())} 筆"
               f"（該條子載波已一律剔除，僅供參考）")
+    if raw_frames:
+        mean_amp = raw_amp_sum / raw_frames
+        zero_pct = raw_zero_count / raw_frames * 100
+        print(f"  - 佈局核對：完整 {len(mean_amp)} 條的平均振幅（{raw_frames} 筆，依陣列索引）")
+        for start in range(0, len(mean_amp), 15):
+            seg = range(start, min(start + 15, len(mean_amp)))
+            print("      " + " ".join(f"[{i}]{mean_amp[i]:.0f}" for i in seg))
+        dead = [i for i in range(len(mean_amp)) if zero_pct[i] > 90]
+        print(f"      恆為 0（> 90% 的幀）的索引：{dead or '無'}"
+              f"　目前假設 DC = 索引 0，已剔除索引 0、1"
+              f"{'' if dead in ([], [0]) else '　⚠ 與假設不符，請把這段貼給維護者核對佈局'}")
     if rssi_samples:
         print(f"  - RSSI：平均 {sum(rssi_samples) / len(rssi_samples):.1f} dBm "
               f"(範圍 {min(rssi_samples)} ~ {max(rssi_samples)})")

@@ -62,6 +62,42 @@ TH_MID_PROM = 3.5
 # 共識度不再是判定條件，僅在低於此值時於畫面上加註提醒
 TH_CONS_NOTE = 0.70
 
+# 每個檔案頭尾各扣掉的秒數：錄製開始與結束時實驗者進出房間、操作電腦造成的暫態。
+# C5 版的錄製協定（2026-11 起）一律扣除前後 10 秒；要原樣分析舊資料時用 --trim 0。
+TRIM_SEC = 10.0
+
+# monitor.py（韌體 CSI_V5 起）寫入的 ESP 端封包抵達時間，微秒
+ESP_TIME_COL = 'EspTime_us'
+
+
+def load_time_axis(df):
+    """回傳從 0 起算的時間軸（秒）。
+
+    優先用 ESP 端時間戳：PC 端的 Timestamp 是 monitor.py 在畫圖迴圈裡才蓋的，
+    樣本一批一批到（C5 空房間實測間隔中位數 3ms、p95 76ms），不是真正的取樣時刻。
+    沒有該欄（舊資料或 V4 韌體）時退回 PC 端時間戳。
+    """
+    if ESP_TIME_COL in df.columns and df[ESP_TIME_COL].notna().all():
+        us = df[ESP_TIME_COL].values.astype(np.int64)
+        step = np.diff(us)
+        step[step < 0] += 2 ** 32          # 32 位元微秒計數約 71.6 分鐘回捲一次
+        return np.r_[0.0, np.cumsum(step)] / 1e6
+    ts = pd.to_datetime(df.iloc[:, 0], format='%H:%M:%S.%f')
+    t = (ts - ts.iloc[0]).dt.total_seconds().values
+    return np.where(t < 0, t + 86400, t)   # 錄製跨過午夜
+
+
+def data_columns(df):
+    """時間欄以外的資料欄（振幅、相位）。"""
+    return [c for c in df.columns[1:] if c != ESP_TIME_COL]
+
+
+def trim_mask(t, sec):
+    """頭尾各扣 sec 秒的布林遮罩；檔案短到扣完不剩時不扣。"""
+    if sec <= 0 or t[-1] <= 2 * sec:
+        return np.ones(len(t), dtype=bool)
+    return (t >= sec) & (t <= t[-1] - sec)
+
 
 class CSIFeatureViewer:
     def __init__(self, root):
@@ -70,6 +106,7 @@ class CSIFeatureViewer:
         self.root.geometry("1280x950")
         self.root.minsize(1000, 700)
 
+        self.trim_sec = TRIM_SEC    # 頭尾各扣掉的秒數，可用 --trim 覆寫
         self.csi_matrix = None      # 原始振幅矩陣（含全零載波）
         self.clean_matrix = None    # 逐條清理後的有效子載波
         self.sub_index = None       # clean_matrix 各欄對應的原始 Sub_n 編號
@@ -197,7 +234,7 @@ class CSIFeatureViewer:
                 # 若檔案含相位欄（_P 後綴），只取振幅欄（_A）。
                 # 相位的物理意義與尺度都和振幅不同，混進同一個 PCA 會破壞融合結果。
                 # 舊格式（Sub_0.. 或 L1..）沒有後綴，則全部視為振幅。
-                data_cols = list(df.columns[1:])
+                data_cols = data_columns(df)
                 phase_cols = [c for c in data_cols if str(c).endswith('_P')]
                 if phase_cols:
                     amp_cols = [c for c in data_cols if str(c).endswith('_A')]
@@ -207,9 +244,10 @@ class CSIFeatureViewer:
                     self.has_phase = False
                 self.amp_col_names = amp_cols
                 csi = df[amp_cols].values.astype(float)
-                # 舊版錄製為毫秒、新版為微秒，%f 兩者皆可解析
-                ts = pd.to_datetime(df.iloc[:, 0], format='%H:%M:%S.%f')
-                time_axis = (ts - ts.iloc[0]).dt.total_seconds().values
+                time_axis = load_time_axis(df)
+                keep_rows = trim_mask(time_axis, self.trim_sec)
+                csi = csi[keep_rows]
+                time_axis = time_axis[keep_rows] - time_axis[keep_rows][0]
                 # 用整段的「總幀數/總時長」估平均 fps；不用逐筆間隔中位數，
                 # 因為 monitor.py 是一次把序列埠緩衝區讀乾，樣本到達本來就一陣一陣的
                 duration = time_axis[-1]
@@ -275,6 +313,7 @@ class CSIFeatureViewer:
             text=f"已載入: {os.path.basename(self.filepath)} "
                  f"({self.csi_matrix.shape[0]} 幀 / {self.time_axis[-1]:.1f}s / "
                  f"實測 {self.fps:.1f} fps / 有效載波 {self.clean_matrix.shape[1]}"
+                 f"{f'，已扣頭尾各 {self.trim_sec:g}s' if self.trim_sec > 0 else ''}"
                  f"{f'，剔除全零 {dropped} 條' if dropped else ''}"
                  f"{'，含相位欄（分析僅用振幅）' if getattr(self, 'has_phase', False) else ''})")
         self.lbl_status.config(text="就緒")
@@ -489,6 +528,12 @@ class CSIFeatureViewer:
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description='CSI 單檔互動分析')
+    ap.add_argument('--trim', type=float, default=TRIM_SEC,
+                    help=f'頭尾各扣掉的秒數（預設 {TRIM_SEC:g}；舊資料用 0）')
+    args = ap.parse_args()
     root = tk.Tk()
     app = CSIFeatureViewer(root)
+    app.trim_sec = args.trim
     root.mainloop()

@@ -66,6 +66,7 @@ uint8_t ap_bssid[6] = {0}; // 只收路由器送來的封包，連線後填入
 
 typedef struct {
   uint32_t seq;       // 單調遞增序號，PC 端可據此偵測傳輸中遺失的行
+  uint32_t esp_us;    // rx_ctrl.timestamp：封包抵達時的 ESP 本地時間（微秒，約 71.6 分鐘回捲）
   uint16_t len;
   int8_t   rssi;
   uint8_t  bb_format; // rx_ctrl.cur_bb_format：1=11a/g 2=HT 3=VHT 4~7=HE
@@ -109,6 +110,7 @@ void _wifi_csi_cb(void *ctx, wifi_csi_info_t *data) {
 
   csi_item_t item;
   item.seq                = ++csi_seq;
+  item.esp_us             = data->rx_ctrl.timestamp;
   item.len                = len;
   item.rssi               = data->rx_ctrl.rssi;
   item.bb_format          = data->rx_ctrl.cur_bb_format;
@@ -125,11 +127,14 @@ void _wifi_csi_cb(void *ctx, wifi_csi_info_t *data) {
 
 
 // 由 loop() 呼叫，把佇列內的 CSI 格式化後輸出
-// 行格式：CSI_V4,<seq>,<len>,<rssi>,<bb_format>,<dropped>,<channel>,<second>,<fwi>,<csi...>
+// 行格式：CSI_V5,<seq>,<len>,<rssi>,<bb_format>,<dropped>,<channel>,<second>,<fwi>,<esp_us>,<csi...>
 //   seq       = 事件序號，PC 端比對跳號即知傳輸中遺失了幾行
 //   dropped   = ESP32 端累計丟棄數（佇列滿 + 長度異常 + 硬體標記無效）
 //   bb_format = 取代 S3 的 sig_mode（C5 的 rx_ctrl 沒有 sig_mode）
 //   fwi       = first_word_invalid，1 表示前 4 bytes（前兩條子載波）因硬體限制無效
+//   esp_us    = 封包抵達的 ESP 端時間（微秒）。V5 新增：PC 端時間戳是在 monitor.py
+//               畫圖迴圈裡才蓋的，樣本會一批一批到（實測間隔中位數 3ms、p95 76ms），
+//               不能代表真正的取樣時刻；這個欄位才是。
 // 回傳是否有輸出任何資料，供 loop 決定要不要讓出 CPU
 bool drain_csi_queue() {
   static char line_buf[4096];
@@ -140,11 +145,12 @@ bool drain_csi_queue() {
     any = true;
     uint32_t dropped = queue_full_drop + oversize_drop + invalid_drop;
     int pos = 0;
-    pos += sprintf(line_buf + pos, "CSI_V4,%lu,%u,%d,%u,%lu,%u,%u,%u",
+    pos += sprintf(line_buf + pos, "CSI_V5,%lu,%u,%d,%u,%lu,%u,%u,%u,%lu",
                    (unsigned long)item.seq, (unsigned)item.len,
                    (int)item.rssi, (unsigned)item.bb_format,
                    (unsigned long)dropped, (unsigned)item.channel,
-                   (unsigned)item.second, (unsigned)item.first_word_invalid);
+                   (unsigned)item.second, (unsigned)item.first_word_invalid,
+                   (unsigned long)item.esp_us);
     for (int i = 0; i < item.len; i++) {
       pos += sprintf(line_buf + pos, ",%d", item.buf[i]);
     }
