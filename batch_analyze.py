@@ -33,7 +33,7 @@ warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyzer_gui import (CSIFeatureViewer, MODES, TOP_K, CONSENSUS_TOL,  # noqa: E402
                           WELCH_WINDOW_SEC, TH_HIGH_PROM, TRIM_SEC,
-                          load_time_axis, data_columns, trim_mask)
+                          load_time_axis, data_columns, trim_mask, fix_c5_layout)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.batch_cache.pkl')
@@ -75,7 +75,7 @@ def sanitize_phase(phase_mat):
 
 def load_file(path, want_phase, trim=TRIM_SEC):
     """讀檔並回傳 (時間軸, fps, 振幅矩陣, 相位矩陣或 None, 欄名)。頭尾各扣 trim 秒。"""
-    df = pd.read_csv(path)
+    df = fix_c5_layout(pd.read_csv(path))
     cols = data_columns(df)
     t = load_time_axis(df)
     keep = trim_mask(t, trim)

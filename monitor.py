@@ -38,21 +38,24 @@ GAP_WARN_THRESHOLD = 0.5  # 秒；相鄰兩筆樣本間隔超過此值視為訊�
 #   - S3：一個封包同時帶 LLTF + HT-LTF (+ STBC)，各 64 條串在一起（256/384 bytes）
 #   - C5：一個封包只帶一種 LTF。韌體只開 HT20/VHT20，固定為 114 bytes = 57 條
 #
-# C5 HT20/VHT20 的陣列順序（ESP-IDF 文件，C5 Wi-Fi 廠商功能章節）：
-#   陣列索引  0~28 → 子載波  0 ~ +28
-#   陣列索引 29~56 → 子載波 -28 ~ -1
+# C5 HT20/VHT20 的陣列順序（實測，2026-11-18）：單純依頻率由低到高
+#   陣列索引  0~27 → 子載波 -28 ~ -1
+#   陣列索引    28 → DC（恆為 0）
+#   陣列索引 29~56 → 子載波  +1 ~ +28
 #
-# 剔除：
-#   - 陣列索引 0（子載波 0）：DC，文件列為無效子載波
-#   - 陣列索引 1（子載波 +1）：C5 的 first_word_invalid——硬體限制使前 4 bytes
-#     （即前兩條子載波）可能無效。若只在旗標為 1 時剔除，欄位會時有時無、
-#     時間序列斷裂，故一律剔除，只損失 1 條。
-# 欄位依實體頻率由低到高排列（-28..-1, +2..+28），熱力圖上相鄰列即相鄰頻率。
+# 這和 ESP-IDF 文件的表格（「0~28, -28~-1」）不同。舊版照文件寫，結果 DC 落在
+# 我們標成 +28 的欄位而恆為 0。以 data/CSI_test 的相位驗證：相鄰子載波的相位應平滑
+# 連續，照文件的排法在接合處誤差約 105°（等於完全對不上），照頻率排只有 4~10°；
+# 振幅在索引 56→2 跳 37%（其實是頻帶兩端），在 27→29 只差 5.7%（隔著 DC 相鄰）。
+#
+# 只剔除 DC。索引 0、1（-28、-27）是 first_word_invalid 涵蓋的前 4 bytes，
+# 但三筆空房間共 18.5 萬幀旗標全為 0，故保留；萬一某幀旗標為 1，沿用上一幀的值，
+# 避免欄位時有時無、時間序列斷裂。
 EXPECTED_LEN = 114                                        # bytes，其他長度整幀丟棄
-_NEG = list(range(29, 57))                                # 子載波 -28 ~ -1
-_POS = list(range(2, 29))                                 # 子載波  +2 ~ +28
-SUBCARRIER_IDX = _NEG + _POS                              # 55 條（陣列索引）
-SUBCARRIER_FREQ = [k - 57 if k >= 29 else k for k in SUBCARRIER_IDX]  # 對應的子載波編號
+DC_IDX = 28
+FWI_IDX = (0, 1)                                          # first_word_invalid 涵蓋的陣列索引
+SUBCARRIER_IDX = [k for k in range(EXPECTED_LEN // 2) if k != DC_IDX]   # 56 條（陣列索引）
+SUBCARRIER_FREQ = [k - DC_IDX for k in SUBCARRIER_IDX]    # 對應的子載波編號 -28..-1, +1..+28
 SUBCARRIERS = len(SUBCARRIER_IDX)
 
 # rx_ctrl.cur_bb_format 的意義（esp_wifi_he_types.h）
@@ -152,7 +155,8 @@ record_count = 0
 error_count = 0
 gap_count = 0
 layout_skip = 0       # 因長度不符預期佈局而丟棄的幀數
-fwi_count = 0         # first_word_invalid=1 的幀數（僅統計；該條子載波已一律剔除）
+fwi_count = 0         # first_word_invalid=1 的幀數（該幀 -28、-27 沿用上一幀的值）
+last_fwi_vals = {}    # 陣列索引 -> 最近一次有效的 (振幅, 相位)
 consecutive_errors = 0  # 連續失敗次數，用於偵測序列埠斷線
 last_sample_time = None
 
@@ -180,8 +184,7 @@ rssi_samples = []
 meta_reported = False
 
 # 完整 57 條（含已剔除的 DC、+1）的振幅統計，用來核對佈局。
-# 實測 3 筆空房間時陣列索引 28（目前標為 +28）恆為 0，與官方文件「索引 0 為 DC」不符，
-# 可能是佈局差一格。結束時印出逐索引平均，恆為 0 的那格才是真正的 DC／空子載波。
+# 正常應只有 DC（索引 28）恆為 0；若換韌體或 ESP-IDF 版本後佈局改變，這裡會先看出來。
 raw_amp_sum = np.zeros(EXPECTED_LEN // 2)
 raw_zero_count = np.zeros(EXPECTED_LEN // 2, dtype=int)
 raw_frames = 0
@@ -281,8 +284,7 @@ def update(frame):
                           f"({declared_len // 2} 條子載波) | RSSI {rssi} dBm | "
                           f"{BB_FORMAT_NAMES.get(bb_format, bb_format)} | 通道 {channel} ({band})")
                     print(f"[擷取] HT/VHT-LTF {SUBCARRIERS} 條"
-                          f"（子載波 {SUBCARRIER_FREQ[0]}~-1、+2~+{SUBCARRIER_FREQ[-1]}，"
-                          f"已剔除 DC 與 first_word 無效的 +1）")
+                          f"（子載波 {SUBCARRIER_FREQ[0]}~-1、+1~+{SUBCARRIER_FREQ[-1]}，已剔除 DC）")
                     print(f"[記錄] {'振幅 + 相位' if RECORD_PHASE else '僅振幅'}"
                           f"，CSV 共 {len(COLUMN_NAMES) + 2} 欄")
                     if kind == "CSI_V4":
@@ -307,6 +309,17 @@ def update(frame):
                     raw_amp_sum += amplitudes
                     raw_zero_count += np.asarray(amplitudes) == 0
                     raw_frames += 1
+
+                    # first_word_invalid：前兩條（-28、-27）這幀無效，沿用上一幀的值
+                    if fwi:
+                        for i in FWI_IDX:
+                            if i in last_fwi_vals:
+                                amplitudes[i], held_phase = last_fwi_vals[i]
+                                if RECORD_PHASE:
+                                    phases[i] = held_phase
+                    else:
+                        for i in FWI_IDX:
+                            last_fwi_vals[i] = (amplitudes[i], phases[i] if RECORD_PHASE else None)
 
                     # 折線圖與熱力圖只顯示振幅，故振幅單獨留一份
                     amp_selected = [amplitudes[i] for i in SUBCARRIER_IDX]
@@ -449,7 +462,7 @@ finally:
         if any(sec != 0 for ch, sec in channel_stats):
             print("      ⚠ 出現次通道（40MHz），請把路由器該頻段的頻寬改為 20MHz")
         print(f"  - first_word_invalid：{fwi_count} / {sum(len_stats.values())} 筆"
-              f"（該條子載波已一律剔除，僅供參考）")
+              f"（這些幀的 -28、-27 沿用上一幀的值）")
     if raw_frames:
         mean_amp = raw_amp_sum / raw_frames
         zero_pct = raw_zero_count / raw_frames * 100
@@ -459,8 +472,8 @@ finally:
             print("      " + " ".join(f"[{i}]{mean_amp[i]:.0f}" for i in seg))
         dead = [i for i in range(len(mean_amp)) if zero_pct[i] > 90]
         print(f"      恆為 0（> 90% 的幀）的索引：{dead or '無'}"
-              f"　目前假設 DC = 索引 0，已剔除索引 0、1"
-              f"{'' if dead in ([], [0]) else '　⚠ 與假設不符，請把這段貼給維護者核對佈局'}")
+              f"　佈局假設 DC = 索引 {DC_IDX}（只剔除這一條）"
+              f"{'　✓ 相符' if dead == [DC_IDX] else '　⚠ 與假設不符，請把這段貼給維護者核對佈局'}")
     if rssi_samples:
         print(f"  - RSSI：平均 {sum(rssi_samples) / len(rssi_samples):.1f} dBm "
               f"(範圍 {min(rssi_samples)} ~ {max(rssi_samples)})")

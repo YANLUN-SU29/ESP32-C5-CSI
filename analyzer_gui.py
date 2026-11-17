@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -85,6 +86,32 @@ def load_time_axis(df):
     ts = pd.to_datetime(df.iloc[:, 0], format='%H:%M:%S.%f')
     t = (ts - ts.iloc[0]).dt.total_seconds().values
     return np.where(t < 0, t + 86400, t)   # 錄製跨過午夜
+
+
+_C5_COL = re.compile(r'^H(-?\d+)(_[AP])?$')
+_C5_OLD_LABELS = set(range(-28, 0)) | set(range(2, 29))
+
+
+def fix_c5_layout(df):
+    """把 2026-11-18 前錄的 C5 檔改成正確的子載波編號，並依頻率重新排序。
+
+    舊版 monitor.py 照 ESP-IDF 文件，把陣列索引 k 標成子載波 k（k ≤ 28）或 k-57（k ≥ 29），
+    實測（相位連續性）證實其實是 k-28：DC 在索引 28，被標成 H28 而恆為 0。
+    辨識方式：H 欄的編號恰為 -28~-1 與 2~28（新版是 -28~-1 與 1~28）。
+    原 H28 改名 H0（DC），全零欄在分析時本來就會被剔除。前一版（S3）的檔案不受影響。
+    """
+    labels = {}
+    for c in df.columns:
+        m = _C5_COL.match(str(c))
+        if m:
+            labels[c] = (int(m.group(1)), m.group(2) or '')
+    if {f for f, _ in labels.values()} != _C5_OLD_LABELS:
+        return df
+    rename = {c: f"H{(f if f >= 0 else f + 57) - 28}{sfx}" for c, (f, sfx) in labels.items()}
+    df = df.rename(columns=rename)
+    others = [c for c in df.columns if c not in rename.values()]
+    ordered = sorted(rename.values(), key=lambda c: (c.endswith('_P'), int(_C5_COL.match(c).group(1))))
+    return df[others + ordered]
 
 
 def data_columns(df):
@@ -228,7 +255,7 @@ class CSIFeatureViewer:
 
     def _load_worker(self, filepath):
         try:
-            df = pd.read_csv(filepath)
+            df = fix_c5_layout(pd.read_csv(filepath))
             has_ts = 'Timestamp' in df.columns or df.columns[0].lower() == 'timestamp'
             if has_ts:
                 # 若檔案含相位欄（_P 後綴），只取振幅欄（_A）。

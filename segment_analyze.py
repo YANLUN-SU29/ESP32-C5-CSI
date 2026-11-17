@@ -40,7 +40,7 @@ from scipy.signal import welch
 warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyzer_gui import (CSIFeatureViewer, MODES, TRIM_SEC,  # noqa: E402
-                          load_time_axis, data_columns, trim_mask)
+                          load_time_axis, data_columns, trim_mask, fix_c5_layout)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 NFFT = 8192
@@ -64,7 +64,7 @@ def parse_label(name):
 
 def load(path, trim=TRIM_SEC):
     """頭尾各扣 trim 秒後，時間軸重新從 0 起算——分段時間窗以扣除後的起點為準。"""
-    df = pd.read_csv(path)
+    df = fix_c5_layout(pd.read_csv(path))
     t = load_time_axis(df)
     keep = trim_mask(t, trim)
     df, t = df[keep], t[keep] - t[keep][0]
